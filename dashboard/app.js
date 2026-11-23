@@ -12,6 +12,7 @@
   var M = DATA.model;
   var app = document.getElementById('board');
   var state = { q: '', category: 'all', chain: 'all', tab: 'pre', sort: 'implied', dir: -1, selected: null, shown: 60,
+    compare: [], pins: [], dtab: 'overview',
     sb: { gw: M.growth_weight, mf: M.maturity_floor, ps: 1 } };
 
   var usd = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 });
@@ -34,22 +35,26 @@
   function fmtMult(n) { return n.toFixed(4).replace(/0+$/, '').replace(/\.$/, '.0'); }
 
   // The published model, recomputed from the row's own figures: base multiple x growth x
-  // maturity, each rounded the way main.ts rounds them. Must equal board.json's number.
+  // maturity x momentum, each rounded the way main.ts rounds them. Must equal board.json's
+  // number. A row from an older board without momentum counts as momentum-neutral (1).
   function publishedImplied(row) {
-    return Math.max(1, Math.round(row.tvl_usd * row.base_multiple * row.growth_multiplier * row.maturity_multiplier));
+    var mom = row.momentum_multiplier === undefined ? 1 : row.momentum_multiplier;
+    return Math.max(1, Math.round(row.tvl_usd * row.base_multiple * row.growth_multiplier * row.maturity_multiplier * mom));
   }
   function sandboxOn() {
     return state.sb.gw !== M.growth_weight || state.sb.mf !== M.maturity_floor || state.sb.ps !== 1;
   }
   // The sandbox: the same formula with the reader's own growth weight, maturity floor and
   // prior scale. It re-ranks the board live; board.json keeps the published model.
+  // Momentum is not a sandbox setting: it stays fixed, as in the published model.
   function effImplied(row) {
     if (!sandboxOn()) return row.implied_value_usd;
     var g = Math.min(M.growth_cap, Math.max(M.growth_floor, row.change_7d === null || row.change_7d === undefined ? 0 : row.change_7d));
     var gm = 1 + (g / 100) * state.sb.gw;
     var age = row.age_days === null || row.age_days === undefined ? M.unknown_age_days : row.age_days;
     var mm = state.sb.mf + (Math.min(Math.max(age, 0), M.maturity_days) / M.maturity_days) * (1 - state.sb.mf);
-    return Math.max(1, Math.round(row.tvl_usd * row.base_multiple * state.sb.ps * gm * mm));
+    var mom = row.momentum_multiplier === undefined ? 1 : row.momentum_multiplier;
+    return Math.max(1, Math.round(row.tvl_usd * row.base_multiple * state.sb.ps * gm * mm * mom));
   }
 
   function el(tag, attrs) {
@@ -138,6 +143,9 @@
     ].map(stepText);
   }
 
+  function knownSlugs(list) {
+    return list.filter(function (s) { return DATA.rows.some(function (r) { return r.slug === s; }); });
+  }
   function readHash() {
     var hash = window.location.hash.replace(/^#/, '');
     if (!hash) return;
@@ -147,6 +155,8 @@
     if (params.get('category')) state.category = params.get('category');
     if (params.get('chain')) state.chain = params.get('chain');
     if (params.get('tab')) state.tab = params.get('tab');
+    if (params.get('c')) state.compare = knownSlugs(params.get('c').split(',')).slice(0, 2);
+    if (params.get('pin')) state.pins = knownSlugs(params.get('pin').split(','));
   }
   function writeHash() {
     var params = new URLSearchParams();
@@ -155,6 +165,8 @@
     if (state.chain !== 'all') params.set('chain', state.chain);
     if (state.tab !== 'pre') params.set('tab', state.tab);
     if (state.selected) params.set('p', state.selected);
+    if (state.compare.length) params.set('c', state.compare.join(','));
+    if (state.pins.length) params.set('pin', state.pins.join(','));
     var next = params.toString();
     if (next) window.history.replaceState(null, '', '#' + next);
     else window.history.replaceState(null, '', window.location.pathname + window.location.search);
@@ -184,6 +196,117 @@
       if (av > bv) return state.dir;
       return a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0;
     });
+  }
+
+  function rowBySlug(slug) {
+    return DATA.rows.filter(function (r) { return r.slug === slug; })[0] || null;
+  }
+  function togglePin(slug) {
+    var i = state.pins.indexOf(slug);
+    if (i >= 0) state.pins.splice(i, 1);
+    else state.pins.push(slug);
+    writeHash();
+    render();
+  }
+  function toggleCompare(slug) {
+    var i = state.compare.indexOf(slug);
+    if (i >= 0) state.compare.splice(i, 1);
+    else {
+      if (state.compare.length >= 2) state.compare.shift();
+      state.compare.push(slug);
+    }
+    writeHash();
+    render();
+  }
+
+  function pinStrip() {
+    var chips = state.pins.map(function (slug) {
+      var r = rowBySlug(slug);
+      if (!r) return null;
+      return el('div', { class: 'pin-chip' },
+        el('span', { class: 'pin-tag', text: 'PINNED' }),
+        el('b', null, '#' + r.rank + ' ', r.name),
+        el('span', { class: 'num', text: fmtUsd(effImplied(r)) }),
+        el('span', { class: 'sub', text: (r.category || 'Other') + ' · ' + fmtPct(r.change_7d) + ' 7d' }),
+        el('button', { type: 'button', class: 'mini-btn', text: 'Details', onclick: function () { openDetail(slug); } }),
+        el('button', { type: 'button', class: 'mini-btn', text: 'Unpin', onclick: function () { togglePin(slug); } })
+      );
+    });
+    return el('section', { class: 'pin-strip', 'aria-label': 'Pinned rows' }, chips);
+  }
+
+  function compareCol(r, other) {
+    var mom = r.momentum_multiplier === undefined ? 1 : r.momentum_multiplier;
+    var winner = r.implied_value_usd > other.implied_value_usd;
+    return el('div', { class: 'compare-col' + (winner ? ' winner' : '') },
+      el('div', { class: 'compare-head' },
+        el('b', null, '#' + r.rank + ' ', r.name, r.watchlist ? el('span', { class: 'wl', text: 'WATCHLIST' }) : null),
+        winner ? el('span', { class: 'win-tag', text: 'Higher implied value' }) : null
+      ),
+      el('div', { class: 'compare-row' }, el('span', { text: 'Category' }), el('b', { text: r.category || 'Other' })),
+      el('div', { class: 'compare-row' }, el('span', { text: 'Chains' }), el('b', { text: (r.chains || []).join(', ') || '—' })),
+      el('div', { class: 'compare-row' }, el('span', { text: 'TVL' }), el('b', { class: 'num', text: fmtUsd(r.tvl_usd) })),
+      el('div', { class: 'compare-row' }, el('span', { text: '7-day growth' }), el('b', { class: 'num', text: fmtPct(r.change_7d) })),
+      el('div', { class: 'compare-row' }, el('span', { text: 'Age with no token' }), el('b', { class: 'num', text: fmtAge(r.age_days) })),
+      el('div', { class: 'compare-row' }, el('span', { text: 'Base multiple' }), el('b', { class: 'num', text: fmtMult(r.base_multiple) + '×' })),
+      el('div', { class: 'compare-row' }, el('span', { text: 'Growth multiplier' }), el('b', { class: 'num', text: fmtMult(r.growth_multiplier) + '×' })),
+      el('div', { class: 'compare-row' }, el('span', { text: 'Maturity multiplier' }), el('b', { class: 'num', text: fmtMult(r.maturity_multiplier) + '×' })),
+      el('div', { class: 'compare-row' }, el('span', { text: 'Momentum multiplier' }), el('b', { class: 'num', text: fmtMult(mom) + '×' + (r.momentum_pct === null || r.momentum_pct === undefined ? '' : ' (' + fmtPct(r.momentum_pct) + ' vs peers)') })),
+      el('div', { class: 'compare-row total' }, el('span', { text: 'Implied value' }), el('b', { class: 'num', text: fmtUsd(r.implied_value_usd) }))
+    );
+  }
+
+  function comparePanel() {
+    var head = el('div', { class: 'compare-head-bar' },
+      el('h2', { text: 'Compare' }),
+      el('button', { type: 'button', class: 'mini-btn', text: 'Clear compare', onclick: function () { state.compare = []; writeHash(); render(); } })
+    );
+    if (state.compare.length < 2) {
+      var only = rowBySlug(state.compare[0]);
+      return el('section', { class: 'panel compare-panel', 'aria-label': 'Compare' }, head,
+        el('p', { class: 'compare-hint', text: (only ? only.name : 'One row') + ' selected — pick one more row in the table to compare side by side.' })
+      );
+    }
+    var a = rowBySlug(state.compare[0]);
+    var b = rowBySlug(state.compare[1]);
+    if (!a || !b) return el('div');
+    return el('section', { class: 'panel compare-panel', 'aria-label': 'Compare' }, head,
+      el('div', { class: 'compare' }, compareCol(a, b), compareCol(b, a))
+    );
+  }
+
+  function csvCell(v) {
+    var s = v === null || v === undefined ? '' : String(v);
+    if (s.indexOf(',') >= 0 || s.indexOf('"') >= 0 || s.indexOf('\n') >= 0) return '"' + s.replace(/"/g, '""') + '"';
+    return s;
+  }
+  // The CSV is the filtered, sorted board — every row the filter shows, not just the
+  // first page on screen. Same columns as the table, raw numbers so they match board.json.
+  function buildCsv(list) {
+    var head = ['Rank', 'Protocol', 'Category', 'Chains', 'TVL (USD)', '7d (%)', 'Age (days)', 'Base x', 'Growth x', 'Maturity x', 'Momentum x', 'Implied value (USD)', 'Token', 'Watchlist'];
+    var lines = [head.map(csvCell).join(',')];
+    list.forEach(function (r) {
+      lines.push([
+        r.rank, r.name, r.category || 'Other', (r.chains || []).join('; '), r.tvl_usd,
+        r.change_7d === null ? '' : r.change_7d, r.age_days === null ? '' : r.age_days,
+        r.base_multiple, r.growth_multiplier, r.maturity_multiplier,
+        r.momentum_multiplier === undefined ? '' : r.momentum_multiplier,
+        r.implied_value_usd, 'no token', r.watchlist ? 'yes' : 'no'
+      ].map(csvCell).join(','));
+    });
+    return lines.join('\n') + '\n';
+  }
+  function downloadCsv() {
+    var csv = buildCsv(sortedRows(rows()));
+    var blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement('a');
+    a.href = url;
+    a.download = 'token-radar-board.csv';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
   }
 
   function header() {
@@ -281,6 +404,7 @@
       el('div', { class: 'field' }, el('label', { for: 'category', text: 'Category' }), catSel),
       el('div', { class: 'field' }, el('label', { for: 'chain', text: 'Chain' }), chainSel),
       el('div', { class: 'field' }, el('span', { class: 'sub', text: 'Token status' }), el('div', { class: 'tabs' }, pre, live)),
+      el('button', { class: 'button', id: 'csv-export', type: 'button', text: 'Export CSV', onclick: downloadCsv }),
       el('span', { class: 'count', text: count })
     );
   }
@@ -313,12 +437,16 @@
         'data-selected': state.selected === r.slug ? 'true' : 'false',
         tabindex: '0',
         onclick: function () { openDetail(r.slug); },
-        onkeydown: function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openDetail(r.slug); } }
+        onkeydown: function (e) { if (e.target !== e.currentTarget) return; if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openDetail(r.slug); } }
       },
         el('td', { class: 'num', text: String(r.rank) }),
         el('td', null, el('div', { class: 'name' },
           el('b', null, r.name, r.watchlist ? el('span', { class: 'wl', text: 'WATCHLIST' }) : null),
-          el('span', { class: 'sub', text: (r.category || 'Other') + ' on ' + (r.chains && r.chains.length ? r.chains.slice(0, 2).join(', ') : 'an unnamed chain') })
+          el('span', { class: 'sub', text: (r.category || 'Other') + ' on ' + (r.chains && r.chains.length ? r.chains.slice(0, 2).join(', ') : 'an unnamed chain') }),
+          el('div', { class: 'row-actions' },
+            el('button', { type: 'button', class: 'mini-btn', 'aria-pressed': state.pins.indexOf(r.slug) >= 0 ? 'true' : 'false', text: state.pins.indexOf(r.slug) >= 0 ? 'Pinned' : 'Pin', onclick: function (e) { e.stopPropagation(); togglePin(r.slug); } }),
+            el('button', { type: 'button', class: 'mini-btn', 'aria-pressed': state.compare.indexOf(r.slug) >= 0 ? 'true' : 'false', text: state.compare.indexOf(r.slug) >= 0 ? 'Comparing' : 'Compare', onclick: function (e) { e.stopPropagation(); toggleCompare(r.slug); } })
+          )
         )),
         el('td', { class: 'num', text: fmtUsd(r.tvl_usd) }),
         el('td', { class: 'num ' + growthClass, text: growth }),
@@ -393,6 +521,32 @@
     return wrap;
   }
 
+  function signalGroup(title, list, val) {
+    return el('div', { class: 'mix-row prior-col' },
+      el('h3', { text: title }),
+      list.map(function (r) {
+        return el('button', { type: 'button', class: 'signal-row', onclick: function () { openDetail(r.slug); } },
+          el('span', { class: 'signal-rank', text: '#' + r.rank }),
+          el('b', { text: r.name }),
+          el('span', { class: 'num', text: val(r) }));
+      }));
+  }
+  function signals() {
+    var rows = DATA.rows;
+    var risers = rows.filter(function (r) { return r.change_7d !== null && r.change_7d !== undefined; })
+      .sort(function (a, b) { return b.change_7d - a.change_7d; }).slice(0, 3);
+    var moms = rows.slice().sort(function (a, b) { return (b.momentum_multiplier || 1) - (a.momentum_multiplier || 1); }).slice(0, 3);
+    var young = rows.filter(function (r) { return r.age_days !== null && r.age_days !== undefined && r.age_days < 365; })
+      .sort(function (a, b) { return b.tvl_usd - a.tvl_usd; }).slice(0, 3);
+    return el('section', { class: 'signals', 'aria-label': 'Top signals' },
+      el('h2', { text: 'Top signals — what moved, who leads' }),
+      el('div', { class: 'signal-grid' },
+        signalGroup('Fastest risers · 7d', risers, function (r) { return fmtPct(r.change_7d); }),
+        signalGroup('Momentum leaders', moms, function (r) { return fmtMult(r.momentum_multiplier || 1) + '×'; }),
+        signalGroup('Young giants · TVL under 1y', young, function (r) { return fmtUsd(r.tvl_usd); })
+      ));
+  }
+
   function priorTable(title, entries) {
     var rows = entries.slice(0, 6).map(function (e) {
       return el('tr', null, el('td', { text: e.name }), el('td', { class: 'num', text: String(e.n) }), el('td', { class: 'num', text: e.median.toFixed(3) + '×' }));
@@ -415,7 +569,11 @@
       el('h2', { text: 'How implied value is computed — model ' + DATA.model_version }),
       el('p', { class: 'sub', text: 'One function scores every row, from the snapshot’s own figures. No protocol name is special-cased, and no row is hand-picked.' }),
       el('div', { class: 'formula' },
-        'implied = round( tvl_usd × base × (1 + clamp(change_7d, ' + M.growth_floor + ', ' + M.growth_cap + ') / 100 × ' + M.growth_weight + ') × (' + M.maturity_floor + ' + min(age_days, ' + M.maturity_days + ') / ' + M.maturity_days + ' × ' + M.maturity_range + ') )',
+        'implied = round( tvl_usd × base × growth × maturity × momentum )',
+        el('br'),
+        'growth = 1 + clamp(change_7d, ' + M.growth_floor + ', ' + M.growth_cap + ') / 100 × ' + M.growth_weight + ' · maturity = ' + M.maturity_floor + ' + min(age_days, ' + M.maturity_days + ') / ' + M.maturity_days + ' × ' + M.maturity_range,
+        el('br'),
+        'momentum = clamp(1 + clamp(change_7d - category peer median, ' + M.momentum_pct_floor + ', ' + M.momentum_pct_cap + ') / 100 × ' + M.momentum_weight + ', ' + M.momentum_mult_floor + ', ' + M.momentum_mult_cap + '); 1 when change_7d is null',
         el('br'),
         'base = clamp( 0.75 × category prior + 0.25 × chain prior, ' + M.prior_floor + ', ' + M.prior_cap + ' ), where a prior is the median market-cap/TVL of the live-token protocols in that group'
       ),
@@ -430,12 +588,61 @@
     );
   }
 
+  var dtabRow = null;
+  function showDtab() {
+    dialog.querySelectorAll('.detail-pane').forEach(function (p) { p.style.display = p.getAttribute('data-pane') === state.dtab ? '' : 'none'; });
+    dialog.querySelectorAll('[data-dtab]').forEach(function (b) { b.setAttribute('aria-pressed', b.getAttribute('data-dtab') === state.dtab ? 'true' : 'false'); });
+  }
+  function priorOf(map, key, min) { var e = map[key]; return (e && e.n >= min) ? e.median : M.global_prior; }
+  function peerMedianOf(row) {
+    var c = row.category || 'Other';
+    var xs = DATA.rows.filter(function (r) { return (r.category || 'Other') === c && r.change_7d !== null && r.change_7d !== undefined; })
+      .map(function (r) { return Math.min(M.growth_cap, Math.max(M.growth_floor, r.change_7d)); });
+    if (!xs.length) xs = DATA.rows.filter(function (r) { return r.change_7d !== null && r.change_7d !== undefined; })
+      .map(function (r) { return Math.min(M.growth_cap, Math.max(M.growth_floor, r.change_7d)); });
+    xs.sort(function (a, b) { return a - b; });
+    var n = xs.length;
+    return Math.round((n % 2 ? xs[(n - 1) / 2] : (xs[n / 2 - 1] + xs[n / 2]) / 2) * 1000) / 1000;
+  }
+  function modelTab(row) {
+    var cat = row.category || 'Other';
+    var chain = (row.chains && row.chains.length) ? row.chains[0] : null;
+    var catEntry = M.by_category[cat];
+    var chainEntry = chain ? M.by_chain[chain] : null;
+    var cp = priorOf(M.by_category, cat, 3);
+    var hp = chain ? priorOf(M.by_chain, chain, 5) : M.global_prior;
+    var cpTxt = cp.toFixed(3) + ' (' + ((catEntry && catEntry.n >= 3) ? cat + ' prior' : 'global prior; ' + cat + ' too small') + ')';
+    var hpTxt = hp.toFixed(3) + ' (' + (chain ? ((chainEntry && chainEntry.n >= 5) ? chain + ' prior' : 'global prior; ' + chain + ' too small') : 'global prior; no chain') + ')';
+    var blend = M.prior_cat_weight * cp + (1 - M.prior_cat_weight) * hp;
+    var g = row.change_7d === null || row.change_7d === undefined ? 0 : Math.min(M.growth_cap, Math.max(M.growth_floor, row.change_7d));
+    var age = row.age_days === null || row.age_days === undefined ? M.unknown_age_days : row.age_days;
+    var ageTxt = row.age_days === null || row.age_days === undefined ? 'unknown (' + M.unknown_age_days + 'd used)' : String(age);
+    var eq = [];
+    eq.push(['TVL', fmtUsd(row.tvl_usd)]);
+    eq.push(['Base multiple', M.prior_cat_weight.toFixed(2) + ' × ' + cpTxt + ' + ' + (1 - M.prior_cat_weight).toFixed(2) + ' × ' + hpTxt + ' = ' + blend.toFixed(4) + ' → clamp [' + M.prior_floor + ', ' + M.prior_cap + '] = ' + fmtMult(row.base_multiple) + '×']);
+    eq.push(['Growth multiplier', '1 + ' + g.toFixed(2) + ' (clamped 7d) / 100 × ' + M.growth_weight + ' = ' + fmtMult(row.growth_multiplier) + '×']);
+    eq.push(['Maturity multiplier', M.maturity_floor + ' + min(max(' + ageTxt + ', 0), ' + M.maturity_days + ') / ' + M.maturity_days + ' × ' + M.maturity_range + ' = ' + fmtMult(row.maturity_multiplier) + '×']);
+    if (row.change_7d === null || row.change_7d === undefined) {
+      eq.push(['Momentum multiplier', 'no reported change — momentum-neutral = 1.0000×']);
+    } else {
+      eq.push(['Momentum multiplier', 'clamp(' + g.toFixed(2) + ' - ' + peerMedianOf(row).toFixed(2) + ' (category peer median), ' + M.momentum_pct_floor + ', ' + M.momentum_pct_cap + ') / 100 × ' + M.momentum_weight + ' → clamp [' + M.momentum_mult_floor + ', ' + M.momentum_mult_cap + '] = ' + fmtMult(row.momentum_multiplier) + '×']);
+    }
+    eq.push(['Implied value', fmtUsd(row.tvl_usd) + ' × ' + fmtMult(row.base_multiple) + ' × ' + fmtMult(row.growth_multiplier) + ' × ' + fmtMult(row.maturity_multiplier) + ' × ' + fmtMult(row.momentum_multiplier === undefined ? 1 : row.momentum_multiplier) + ' = ' + fmtUsd(publishedImplied(row))]);
+    return el('div', { class: 'detail-section' },
+      el('h3', { text: 'The equation, with this row’s numbers' }),
+      el('div', { class: 'equation' }, eq.map(function (r) {
+        return el('div', null, el('span', { text: r[0] }), el('b', { class: 'num', text: r[1] }));
+      })),
+      el('p', { class: 'check', text: 'Every number above is recomputed from the snapshot beside this page — the same arithmetic main.ts runs, and the same number board.json carries.' })
+    );
+  }
   var dialog = el('dialog', { class: 'detail', id: 'detail', 'aria-labelledby': 'detail-title' });
   dialog.addEventListener('close', function () { state.selected = null; writeHash(); });
 
   function openDetail(slug) {
     var row = DATA.rows.filter(function (r) { return r.slug === slug; })[0];
     if (!row) return;
+    if (dtabRow !== slug) { state.dtab = 'overview'; dtabRow = slug; }
     state.selected = slug;
     writeHash();
     dialog.textContent = '';
@@ -449,7 +656,13 @@
       ),
       el('button', { class: 'close', type: 'button', 'aria-label': 'Close details', text: 'Close', onclick: function () { dialog.close(); } })
     ));
-    dialog.appendChild(el('section', { class: 'detail-section' },
+    dialog.appendChild(el('div', { class: 'tabs detail-tabs', role: 'tablist' },
+      [['overview', 'Overview'], ['model', 'Model'], ['farm', 'Farm plan']].map(function (t) {
+        return el('button', { type: 'button', role: 'tab', 'data-dtab': t[0], 'aria-pressed': state.dtab === t[0] ? 'true' : 'false', text: t[1], onclick: function () { state.dtab = t[0]; showDtab(); } });
+      })
+    ));
+    var ovPane = el('div', { class: 'detail-pane', 'data-pane': 'overview' });
+    ovPane.appendChild(el('section', { class: 'detail-section' },
       el('h3', { text: 'Implied value' }),
       el('div', { class: 'equation' },
         el('div', null, el('span', { text: 'TVL' }), el('b', { class: 'num', text: fmtUsd(row.tvl_usd) })),
@@ -458,13 +671,19 @@
         el('div', null, el('span', { text: 'Base multiple (category × chain prior)' }), el('b', { class: 'num', text: fmtMult(row.base_multiple) + '×' })),
         el('div', null, el('span', { text: 'Growth multiplier' }), el('b', { class: 'num', text: fmtMult(row.growth_multiplier) + '×' })),
         el('div', null, el('span', { text: 'Maturity multiplier' }), el('b', { class: 'num', text: fmtMult(row.maturity_multiplier) + '×' })),
+        el('div', null, el('span', { text: 'Momentum multiplier' }), el('b', { class: 'num', text: fmtMult(row.momentum_multiplier === undefined ? 1 : row.momentum_multiplier) + '×' + (row.momentum_pct === null || row.momentum_pct === undefined ? '' : ' (' + fmtPct(row.momentum_pct) + ' vs peers)') })),
         el('div', { class: 'total' }, el('span', { text: 'Implied value' }), el('b', { class: 'num', text: fmtUsd(row.implied_value_usd) }))
       ),
       el('p', { class: 'check' }, sandboxOn()
         ? 'The sandbox is on: with your settings this row would be ' + fmtUsd(effImplied(row)) + '. The published model above still gives ' + fmtUsd(row.implied_value_usd) + '.'
         : 'This page recomputes ' + fmtUsd(check) + ' from the same figures — the same number board.json carries. This is an estimate, not a price.')
     ));
-    dialog.appendChild(el('section', { class: 'detail-section' },
+    dialog.appendChild(ovPane);
+    var moPane = el('div', { class: 'detail-pane', 'data-pane': 'model' });
+    moPane.appendChild(modelTab(row));
+    dialog.appendChild(moPane);
+    var faPane = el('div', { class: 'detail-pane', 'data-pane': 'farm' });
+    faPane.appendChild(el('section', { class: 'detail-section' },
       el('h3', { text: 'Farm plan — 7 steps' }),
       el('ol', { class: 'steps' }, steps.map(function (s) {
         var at = s.indexOf(' Cost: ');
@@ -473,7 +692,9 @@
         return el('li', null, el('b', { text: action }), el('span', { class: 'cost', text: tail }));
       }))
     ));
-    dialog.appendChild(el('p', { class: 'risk', text: 'Risk, stated plainly: a farm is a bet on a token that may never launch, on a contract that may be exploited, and on points that may be worth nothing. Never farm with money you cannot lose, and never pay anyone to claim.' }));
+    faPane.appendChild(el('p', { class: 'risk', text: 'Risk, stated plainly: a farm is a bet on a token that may never launch, on a contract that may be exploited, and on points that may be worth nothing. Never farm with money you cannot lose, and never pay anyone to claim.' }));
+    dialog.appendChild(faPane);
+    showDtab();
     if (typeof dialog.showModal === 'function') {
       if (!dialog.open) dialog.showModal();
     } else {
@@ -491,6 +712,7 @@
       shell.appendChild(lede());
       shell.appendChild(sandbox());
       shell.appendChild(mix());
+      shell.appendChild(signals());
       shell.appendChild(controls());
       slot = el('div', { id: 'slot' });
       shell.appendChild(slot);
@@ -512,7 +734,15 @@
   // mid-gesture to a fresh element.
   function update() {
     slot.textContent = '';
-    slot.appendChild(state.tab === 'pre' ? boardTable() : liveView());
+    if (state.tab === 'pre') {
+      if (state.pins.length) slot.appendChild(pinStrip());
+      if (state.compare.length) slot.appendChild(comparePanel());
+      slot.appendChild(boardTable());
+    } else {
+      slot.appendChild(liveView());
+    }
+    var csvBtn = document.getElementById('csv-export');
+    if (csvBtn) csvBtn.style.display = state.tab === 'pre' ? '' : 'none';
     var mp = app.querySelector('.model');
     if (mp) mp.style.display = state.tab === 'pre' ? '' : 'none';
     var c = app.querySelector('.count');
