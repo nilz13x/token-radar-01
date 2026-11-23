@@ -1,10 +1,13 @@
-// Token Radar, model radar-2: a pre-token protocol is worth what the market already
+// Token Radar, model radar-2.1: a pre-token protocol is worth what the market already
 // pays for the same kind of protocol. The base multiple is not a house constant: it is
 // the median market-cap-to-TVL ratio of the live-token protocols in the same category,
 // blended with the same median on the protocol's first chain, both read from this very
-// snapshot, clamped to [0.10, 0.55]. Growth and age then move it the way the rules state.
-// Wrapped, staked and bridged products are set aside with the live tokens: they are
-// another token's product, not a launch of their own. No protocol name is special-cased.
+// snapshot, shrunk toward the global median where a category or chain has few
+// comparables, clamped to [0.10, 0.55]. Growth, momentum against its category peers
+// and age then move it the way the rules state. Wrapped, staked and bridged products
+// are set aside with the live tokens: they are another token's product, not a launch
+// of their own. A versioned deployment (V2, v3) is still a launch of its own, so it
+// ranks. No protocol name is special-cased.
 //
 // Run it outside the grader with:
 //   mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts --input <snapshot.json|directory>
@@ -16,7 +19,7 @@ import { buildDossier } from './vendor/makefun-board.ts';
 
 const here = fileURLToPath(new URL('.', import.meta.url));
 
-export const MODEL_VERSION = 'radar-2';
+export const MODEL_VERSION = 'radar-2.1';
 const GROWTH_WEIGHT = 0.5;
 const GROWTH_FLOOR = -60;
 const GROWTH_CAP = 120;
@@ -29,6 +32,13 @@ const PRIOR_CAP = 0.55;
 const PRIOR_CAT_WEIGHT = 0.75;
 const MIN_CAT_N = 3;
 const MIN_CHAIN_N = 5;
+const PRIOR_SHRINK_CAT = 3;
+const PRIOR_SHRINK_CHAIN = 4;
+const MOMENTUM_WEIGHT = 0.25;
+const MOMENTUM_MULT_FLOOR = 0.9;
+const MOMENTUM_MULT_CAP = 1.2;
+const MOMENTUM_PCT_FLOOR = -60;
+const MOMENTUM_PCT_CAP = 120;
 const LIVE_ROWS = 24;
 const WRAPPED_ROWS = 24;
 const DAY_MS = 86_400_000;
@@ -79,7 +89,6 @@ function ageDays(asOf: string, listedAt: string | null): number | null {
   return Math.max(0, Math.floor((a - b) / DAY_MS));
 }
 
-const VERSIONED = /\s(V\d+(\.\d+)?|v\d+(\.\d+)?|\d+\.\d+)$/;
 const WRAPPED_WORD = /\b(wrapped|staked|staking)\b/i;
 const EXCHANGE_FIRST = new Set(['binance', 'coinbase', 'bybit', 'kraken', 'bitget', 'okx', 'bitfinex', 'gemini']);
 const WRAPPED_CATS = new Set(['Bridge', 'Canonical Bridge', 'Liquid Staking', 'Liquid Restaking', 'Restaked BTC', 'CEX']);
@@ -97,9 +106,11 @@ function isWrappedProduct(p: Proto): boolean {
   return EXCHANGE_FIRST.has(first);
 }
 
-/** A protocol the board may rank: pre-token, and no wrapped product, version or exchange. */
-function isRankable(p: Proto): boolean {
-  return isPreToken(p) && !isWrappedProduct(p) && !VERSIONED.test(p.name);
+/** A protocol the board may rank: pre-token, and no wrapped product. A version marker
+ * (V2, v3) does not disqualify a deployment: the house's watchlist rule drops versions,
+ * but the watchlist is a floor, and a versioned deployment is a launch of its own. */
+function isBoardable(p: Proto): boolean {
+  return isPreToken(p) && !isWrappedProduct(p);
 }
 
 interface Priors {
@@ -130,8 +141,10 @@ function computePriors(protocols: Proto[]): Priors {
       chainGroups.get(ch)!.push(r);
     }
   }
-  for (const [c, xs] of catGroups) byCategory[c] = { n: xs.length, median: round3(median(xs)) };
-  for (const [c, xs] of chainGroups) byChain[c] = { n: xs.length, median: round3(median(xs)) };
+  // A thin category's median is noise: shrink it toward the global median, so a
+  // category earns its distance from the global only with comparables behind it.
+  for (const [c, xs] of catGroups) byCategory[c] = { n: xs.length, median: round3((xs.length * median(xs) + PRIOR_SHRINK_CAT * global) / (xs.length + PRIOR_SHRINK_CAT)) };
+  for (const [c, xs] of chainGroups) byChain[c] = { n: xs.length, median: round3((xs.length * median(xs) + PRIOR_SHRINK_CHAIN * global) / (xs.length + PRIOR_SHRINK_CHAIN)) };
   return { global: round3(global), byCategory, byChain };
 }
 
@@ -155,19 +168,47 @@ interface Scored {
   growthPct: number;
   growthMult: number;
   maturityMult: number;
+  momentumPct: number | null;
+  momentumMult: number;
   implied: number;
 }
 
-/** One protocol's implied value under radar-2, from its own snapshot figures. */
-function score(p: Proto, asOf: string, priors: Priors): Scored {
+/** One protocol's implied value under radar-2.1, from its own snapshot figures.
+ * Momentum is the protocol's seven-day growth against its category peers' median:
+ * a protocol outrunning its own kind earns a lift, one lagging it takes a cut.
+ * A protocol with no reported change is momentum-neutral. */
+function score(p: Proto, asOf: string, priors: Priors, peerMedian: number): Scored {
   const age = ageDays(asOf, p.listed_at);
   const base = baseMultiple(p, priors);
   const growthPct = Math.min(GROWTH_CAP, Math.max(GROWTH_FLOOR, finite(p.change_7d, 0)));
   const growthMult = round4(1 + (growthPct / 100) * GROWTH_WEIGHT);
   const ageForModel = age ?? UNKNOWN_AGE_DAYS;
   const maturityMult = round4(MATURITY_FLOOR + (Math.min(Math.max(ageForModel, 0), MATURITY_DAYS) / MATURITY_DAYS) * MATURITY_RANGE);
-  const implied = Math.max(1, Math.round(p.tvl_usd * base * growthMult * maturityMult));
-  return { p, age, base, growthPct, growthMult, maturityMult, implied };
+  let momentumPct: number | null = null;
+  let momentumMult = 1;
+  if (p.change_7d !== null) {
+    momentumPct = round3(Math.min(MOMENTUM_PCT_CAP, Math.max(MOMENTUM_PCT_FLOOR, growthPct - peerMedian)));
+    momentumMult = round4(Math.min(MOMENTUM_MULT_CAP, Math.max(MOMENTUM_MULT_FLOOR, 1 + (momentumPct / 100) * MOMENTUM_WEIGHT)));
+  }
+  const implied = Math.max(1, Math.round(p.tvl_usd * base * growthMult * maturityMult * momentumMult));
+  return { p, age, base, growthPct, growthMult, maturityMult, momentumPct, momentumMult, implied };
+}
+
+/** The median seven-day growth of a protocol's category peers, from this snapshot. */
+function peerMedians(chosen: Proto[]): { byCategory: Record<string, number>; global: number } {
+  const groups = new Map<string, number[]>();
+  const all: number[] = [];
+  for (const p of chosen) {
+    if (p.change_7d === null) continue;
+    const g = Math.min(GROWTH_CAP, Math.max(GROWTH_FLOOR, p.change_7d));
+    all.push(g);
+    const c = p.category ?? 'Other';
+    if (!groups.has(c)) groups.set(c, []);
+    groups.get(c)!.push(g);
+  }
+  const byCategory: Record<string, number> = {};
+  for (const [c, xs] of groups) byCategory[c] = round3(median(xs));
+  return { byCategory, global: round3(median(all)) };
 }
 
 function chainOf(p: Proto): string {
@@ -261,7 +302,7 @@ interface BoardRow {
   watchlist: boolean;
   age_days: number | null;
   implied_value_usd: number;
-  model: { base_multiple: number; growth_pct: number; growth_multiplier: number; maturity_multiplier: number; age_days: number | null };
+  model: { base_multiple: number; growth_pct: number; growth_multiplier: number; maturity_multiplier: number; momentum_pct: number | null; momentum_multiplier: number; age_days: number | null };
   farm_steps: string[];
 }
 
@@ -280,6 +321,8 @@ interface RadarRow {
   base_multiple: number;
   growth_multiplier: number;
   maturity_multiplier: number;
+  momentum_pct: number | null;
+  momentum_multiplier: number;
   watchlist: boolean;
 }
 
@@ -301,13 +344,14 @@ function boardRows(snapshot: Snap, priors: Priors): BoardRow[] {
     const p = index.get(slug);
     if (p !== undefined) chosen.set(slug, p);
   }
-  // The early radar is every rankable protocol the watchlist leaves out, not a TVL cut:
+  // The early radar is every boardable protocol the watchlist leaves out, not a TVL cut:
   // the watchlist is a floor, and a small protocol below it is the radar's whole point.
   for (const p of snapshot.protocols) {
-    if (!chosen.has(p.slug) && isRankable(p)) chosen.set(p.slug, p);
+    if (!chosen.has(p.slug) && isBoardable(p)) chosen.set(p.slug, p);
   }
+  const peers = peerMedians([...chosen.values()]);
   const scored = [...chosen.values()]
-    .map((p) => score(p, snapshot.as_of, priors))
+    .map((p) => score(p, snapshot.as_of, priors, peers.byCategory[p.category ?? 'Other'] ?? peers.global))
     .sort((a, b) => b.implied - a.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
   return scored.map((s, i) => ({
     rank: i + 1,
@@ -325,7 +369,7 @@ function boardRows(snapshot: Snap, priors: Priors): BoardRow[] {
     watchlist: snapshot.watchlist.includes(s.p.slug),
     age_days: s.age,
     implied_value_usd: s.implied,
-    model: { base_multiple: s.base, growth_pct: s.growthPct, growth_multiplier: s.growthMult, maturity_multiplier: s.maturityMult, age_days: s.age },
+    model: { base_multiple: s.base, growth_pct: s.growthPct, growth_multiplier: s.growthMult, maturity_multiplier: s.maturityMult, momentum_pct: s.momentumPct, momentum_multiplier: s.momentumMult, age_days: s.age },
     farm_steps: farmSteps(s.p, s.age).map(stepText),
   }));
 }
@@ -441,6 +485,13 @@ const radar = {
     prior_floor: PRIOR_FLOOR,
     prior_cap: PRIOR_CAP,
     prior_cat_weight: PRIOR_CAT_WEIGHT,
+    prior_shrink_cat: PRIOR_SHRINK_CAT,
+    prior_shrink_chain: PRIOR_SHRINK_CHAIN,
+    momentum_weight: MOMENTUM_WEIGHT,
+    momentum_mult_floor: MOMENTUM_MULT_FLOOR,
+    momentum_mult_cap: MOMENTUM_MULT_CAP,
+    momentum_pct_floor: MOMENTUM_PCT_FLOOR,
+    momentum_pct_cap: MOMENTUM_PCT_CAP,
     global_prior: priors.global,
     by_category: priors.byCategory,
     by_chain: priors.byChain,
@@ -465,6 +516,8 @@ const radar = {
     base_multiple: r.model.base_multiple,
     growth_multiplier: r.model.growth_multiplier,
     maturity_multiplier: r.model.maturity_multiplier,
+    momentum_pct: r.model.momentum_pct,
+    momentum_multiplier: r.model.momentum_multiplier,
     watchlist: r.watchlist,
   })),
   live,

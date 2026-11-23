@@ -8,17 +8,23 @@ A token launch radar: it reads a frozen DefiLlama snapshot of 758 protocols, ran
 pre-token ones by what their launch would be worth, and hands in a web dashboard with
 the board, a detail view for each protocol, and the steps to farm it.
 
-## The model (radar-2)
+## The model (radar-2.1)
 
 Implied value is not a house constant. The base multiple is the median
 market-cap-to-TVL ratio of the live-token protocols in the same category, blended with
-the same median on the protocol's first chain — both read from the snapshot itself —
-clamped to [0.10, 0.55]. Seven-day growth and age with no token then move it:
+the same median on the protocol's first chain — both read from the snapshot itself,
+each shrunk toward the global median so a thin category earns its distance only with
+comparables behind it — clamped to [0.10, 0.55]. Seven-day growth, momentum against
+its category peers, and age with no token then move it:
 
 ```
 implied = round(tvl_usd × base × (1 + clamp(change_7d, -60, 120) / 100 × 0.5)
+                × clamp(1 + clamp(change_7d - peer_median_7d, -60, 120) / 100 × 0.25, 0.90, 1.20)
                 × (0.6 + min(age_days, 1095) / 1095 × 0.4))
 ```
+
+Momentum is the protocol's 7-day change minus its category peers' median change; a
+protocol with no reported change is momentum-neutral (×1).
 
 Wrapped, staked and bridged products are set aside with the live-token protocols: they
 are another token's product, not a launch of their own. No protocol name is
