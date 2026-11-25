@@ -8,23 +8,32 @@ A token launch radar: it reads a frozen DefiLlama snapshot of 758 protocols, ran
 pre-token ones by what their launch would be worth, and hands in a web dashboard with
 the board, a detail view for each protocol, and the steps to farm it.
 
-## The model (radar-2.1)
+## The model (radar-3)
 
-Implied value is not a house constant. The base multiple is the median
-market-cap-to-TVL ratio of the live-token protocols in the same category, blended with
-the same median on the protocol's first chain — both read from the snapshot itself,
-each shrunk toward the global median so a thin category earns its distance only with
-comparables behind it — clamped to [0.10, 0.55]. Seven-day growth, momentum against
-its category peers, and age with no token then move it:
+Implied value is fitted, not assumed. The base multiple comes from a power
+law fitted on the live-token protocols in this very snapshot — log(market
+cap) = 6.4097 + 0.5554 · log(TVL), fitted robustly (Theil-Sen) on the 128
+live tokens with a positive market cap and TVL — so a bigger protocol earns
+a lower multiple and a smaller one a higher one. Every other value term
+(growth, age, momentum against category peers) was fitted on the same live
+tokens and then kept or dropped on two blind tests: leave-one-out (MedALE
+1.2524, ×1.2961 against the global-median baseline) and walk-forward
+(MedALE 1.0011, ×1.6646; fitted on the older 47 dated tokens, tested on
+the newer 48). The blind tests dropped growth and momentum, so the board
+ranks on the power law plus a maturity term; 36 of the 128 held-out tokens
+land within 2× of their true market cap, 58 within 3×.
 
-```
-implied = round(tvl_usd × base × (1 + clamp(change_7d, -60, 120) / 100 × 0.5)
-                × clamp(1 + clamp(change_7d - peer_median_7d, -60, 120) / 100 × 0.25, 0.90, 1.20)
-                × (0.6 + min(age_days, 1095) / 1095 × 0.4))
-```
+Each row carries its value range (low–high) from the leave-one-out
+residuals, wider where the category has few live comparables. Every board
+row also has a fully costed farm plan on a standard $100 deposit (second
+action $25): the expected reward is 5% of the row's implied launch value
+shared pro-rata on the $100 against the protocol's TVL, and $/hour is that
+reward over the plan's active hours (35 one-off minutes plus 20 minutes a
+week over the hold); the low/high $/hour come from the row's value range.
 
-Momentum is the protocol's 7-day change minus its category peers' median change; a
-protocol with no reported change is momentum-neutral (×1).
+All 758 protocols in the snapshot are accounted for: 209 board rows, 129
+live tokens set aside, 133 wrapped/staked/bridged products set aside, and
+287 pre-token protocols with a listing but no market cap.
 
 Wrapped, staked and bridged products are set aside with the live-token protocols: they
 are another token's product, not a launch of their own. No protocol name is
